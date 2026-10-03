@@ -8,6 +8,8 @@ from slime.utils.misc import should_run_periodic_action
 
 def train(args):
     configure_logger()
+
+    # release_train 模式
     release_train = args.release_train
 
     # allocate the GPUs
@@ -50,6 +52,7 @@ def train(args):
         if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
             ray.get(rollout_manager.eval.remote(rollout_id))
 
+        # NOTE: rollout
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
 
         if args.offload_rollout:
@@ -58,6 +61,7 @@ def train(args):
         if release_train:
             actor_model.create()
 
+        # 支持一种模式, num_critic_only_steps 之前不训练 actor
         actor_trains = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
         if args.use_critic:
             value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
@@ -66,6 +70,7 @@ def train(args):
             else:
                 ray.get(value_refs)
         else:
+            # NOTE: actor train
             ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
 
         # Runtime completion releases queue capacity, without claiming that the
