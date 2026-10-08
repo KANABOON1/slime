@@ -98,22 +98,28 @@ def _create_placement_group(num_gpus):
 
 
 def _get_placement_group_layout(args) -> tuple[int, int]:
+    """计算 gpu 的分配布局, 返回两个数:
+    1. num_gpus: 这个 placement group 总共需要多少 gpus;
+    2. rollout_offset: rollout 的 gpu 从整个 gpu 列表的第几个位置开始。
+    """
+    # 计算 actor 总共需要多少 gpus
     actor_num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
 
-    if args.debug_train_only:
+    if args.debug_train_only:    # 只调试训练, 不 rollout
         return actor_num_gpus, 0
 
-    if args.rollout_external:
+    if args.rollout_external:    # rollout 的计算资源不由当前这个 placement group 提供
         if args.debug_rollout_only:
             return actor_num_gpus, 0
         return actor_num_gpus, actor_num_gpus
 
-    if args.debug_rollout_only:
+    if args.debug_rollout_only:  # 只调试 rollout
         return args.rollout_num_gpus, 0
 
-    if args.colocate:
+    if args.colocate:  # colocate 时, actor 和 rollout 在同一批卡上
         return max(actor_num_gpus, args.rollout_num_gpus), 0
 
+    # 不 colocate 时, actor 和 rollout 各自用各自的卡
     return actor_num_gpus + args.rollout_num_gpus, actor_num_gpus
 
 
@@ -123,6 +129,7 @@ def create_placement_groups(args):
     num_gpus, rollout_offset = _get_placement_group_layout(args)
 
     logger.info(f"Creating placement group with {num_gpus} GPUs...")
+    # 向 ray 创建一个包含 num_gpus 长的 gpu 的 placement group, 并返回这个资源池以及后续定位这些 gpu 所需要的信息
     pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
     rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
     rollout_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[rollout_offset:]
@@ -218,12 +225,16 @@ def create_training_models(args, pgs, rollout_manager, actor_cls=None):
     if args.start_rollout_id is None:
         args.start_rollout_id = start_rollout_ids[0]
 
+    # 加载上一次 rollout 结束之后得到的模型
     ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
 
     return actor_model, critic_model
 
 
 def create_rollout_manager(args, pg):
+    """创建并初始化一个 rollout manager, 负责后续 rollout/采样相关工作的统一管理,
+    同时根据配置确定总共要跑多少轮 rollout。
+    """
     from .rollout import RolloutManager
 
     rollout_manager_options = {
@@ -246,7 +257,7 @@ def create_rollout_manager(args, pg):
         ray.get(rollout_manager.check_weights.remote(action="snapshot"))
         ray.get(rollout_manager.check_weights.remote(action="reset_tensors"))
 
-    if args.offload_rollout:
+    if args.offload_rollout:  # 让 rollout manager 把 rollout 相关资源暂时 offload
         ray.get(rollout_manager.offload.remote())
 
     return rollout_manager, num_rollout_per_epoch

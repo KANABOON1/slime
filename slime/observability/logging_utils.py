@@ -14,6 +14,7 @@ def configure_logger(prefix: str = ""):
     if _LOGGER_CONFIGURED:
         return
 
+    # 确保整个程序仅初始化一次该日志
     _LOGGER_CONFIGURED = True
 
     logging.basicConfig(
@@ -25,6 +26,7 @@ def configure_logger(prefix: str = ""):
 
 
 def init_tracking(args, primary: bool = True, **kwargs):
+    """初始化实验追踪, 根据 primary 决定当前进程是主要的 wandb 进程还是次要的进程。"""
     if primary:
         wandb_utils.init_wandb_primary(args, **kwargs)
     else:
