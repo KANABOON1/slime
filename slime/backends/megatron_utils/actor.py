@@ -399,6 +399,13 @@ class MegatronTrainRayActor(TrainRayActor):
         with timer("data_preprocess"):
             rollout_data = self._get_rollout_data(rollout_data_ref)
 
+        if not rollout_data["num_microbatches"]:
+            # Outcome-only batches advance sampling/checkpoint progress, not the
+            # optimizer or its scheduler. Every DP rank receives the empty schedule.
+            if self.args.offload_train:
+                self.sleep()
+            return None
+
         if self.role == "critic":
             result = self.train_critic(rollout_id, rollout_data)
         else:

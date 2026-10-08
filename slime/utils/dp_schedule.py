@@ -79,6 +79,44 @@ def _pack_step_into_mbs(
     return [list(range(i, min(i + micro_batch_size, n))) for i in range(0, n, micro_batch_size)]
 
 
+def prepare_sparse_batch(
+    data: dict, parallel: dict, global_batch_size: int, *, micro_batch_size: int
+) -> dict:
+    """Keep outcome-only rollouts in step boundaries, but never run them on a model.
+
+    Sparse DP steps use copies of real samples with zero loss masks for collective
+    alignment. These copies have no additional rollout identity or learning weight.
+    """
+    order = list(dict.fromkeys(data["rollout_ids"]))
+    align = parallel["dp_size"] * (
+        parallel["microbatch_group_size_per_vp_stage"] if parallel["vpp_size"] > 1 else 1
+    )
+    # Dynamic packing can split bins down to individual samples. Static
+    # packing needs a full microbatch per aligned slot.
+    align *= micro_batch_size
+    selected = []
+    padding = []
+    for start in range(0, len(order) - global_batch_size + 1, global_batch_size):
+        step_ids = set(order[start : start + global_batch_size])
+        active = [
+            i for i, rid in enumerate(data["rollout_ids"])
+            if rid in step_ids and any(data["loss_masks"][i])
+        ]
+        selected.extend(active)
+        padding.extend(False for _ in active)
+        if active:
+            count = (-len(active)) % align
+            selected.extend([active[0]] * count)
+            padding.extend(True for _ in range(count))
+    result = {key: [values[i] for i in selected] for key, values in data.items()}
+    result["loss_masks"] = [
+        [0] * len(mask) if is_padding else mask
+        for mask, is_padding in zip(result["loss_masks"], padding, strict=True)
+    ]
+    result["rollout_order"] = order
+    return result
+
+
 def build_dp_schedule(
     args: Any,
     train_parallel_config: dict,
@@ -86,6 +124,7 @@ def build_dp_schedule(
     *,
     global_batch_size: int,
     rollout_indices: list[int],
+    rollout_order: list[int] | None = None,
 ) -> tuple[list[list[int]], list[list[list[int]]], list[int], list[int]]:
     """Compute the per-rank DP partition and micro-batch schedule.
 
@@ -130,7 +169,7 @@ def build_dp_schedule(
     rollout_id_to_samples: dict[int, list[int]] = {}
     for sample_pos, rid in enumerate(rollout_indices):
         rollout_id_to_samples.setdefault(rid, []).append(sample_pos)
-    rollout_ids = list(rollout_id_to_samples.keys())
+    rollout_ids = list(rollout_id_to_samples.keys()) if rollout_order is None else rollout_order
 
     num_steps = len(rollout_ids) // global_batch_size
     assert num_steps >= 1, (
@@ -145,7 +184,9 @@ def build_dp_schedule(
 
     for step_i in range(num_steps):
         step_rollouts = rollout_ids[step_i * global_batch_size : (step_i + 1) * global_batch_size]
-        sample_indices = [pos for rid in step_rollouts for pos in rollout_id_to_samples[rid]]
+        sample_indices = [pos for rid in step_rollouts for pos in rollout_id_to_samples.get(rid, [])]
+        if not sample_indices:
+            continue
         step_lengths = [total_lengths[i] for i in sample_indices]
         global_batch_sizes.append(global_batch_size)
         assert len(sample_indices) >= dp_size, (

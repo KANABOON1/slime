@@ -18,7 +18,7 @@ from slime.observability.rollout_data_utils import (
     validate_rollout_routed_experts_for_replay,
 )
 from slime.utils.data import get_source
-from slime.utils.dp_schedule import build_dp_schedule
+from slime.utils.dp_schedule import build_dp_schedule, prepare_sparse_batch
 from slime.utils.misc import Box, load_function
 from slime.utils.rollout_transport import DiskPayloadRef, RolloutGroupRef, TrainBatchRef, pack_rollout_payload
 from slime.utils.tensor_store import TensorRef
@@ -435,6 +435,13 @@ class BatchBuilder:
         global_batch_size`` regardless of how many training samples each
         rollout produced.
         """
+        if any(not any(mask) for mask in data["loss_masks"]):
+            data = prepare_sparse_batch(
+                data,
+                self.train_parallel_config,
+                self.args.global_batch_size,
+                micro_batch_size=1 if self.args.use_dynamic_batch_size else self.args.micro_batch_size,
+            )
         dp_size = self.train_parallel_config["dp_size"]
         total_lengths = [len(t) for t in data["tokens"]]
         data["total_lengths"] = total_lengths
@@ -445,6 +452,7 @@ class BatchBuilder:
             total_lengths,
             global_batch_size=self.args.global_batch_size,
             rollout_indices=data["rollout_ids"],
+            rollout_order=data.get("rollout_order"),
         )
 
         # Package per-rank rollout_data
