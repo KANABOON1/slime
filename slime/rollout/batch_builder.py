@@ -435,7 +435,9 @@ class BatchBuilder:
         global_batch_size`` regardless of how many training samples each
         rollout produced.
         """
-        if any(not any(mask) for mask in data["loss_masks"]):
+        # Dense dynamic batches also need zero-loss padding when splitting
+        # reaches one sample per microbatch before DP alignment is satisfied.
+        if self.args.use_dynamic_batch_size or any(not any(mask) for mask in data["loss_masks"]):
             data = prepare_sparse_batch(
                 data,
                 self.train_parallel_config,
