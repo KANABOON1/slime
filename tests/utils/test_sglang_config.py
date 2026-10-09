@@ -437,9 +437,10 @@ class TestZeroGpuRolloutConfig:
         assert ray_get_calls == [["encoder-init-0"], ["encoder-url-ref"]]
 
 
+@pytest.mark.parametrize("shared", [False, True])
 @pytest.mark.parametrize("first_model", ["regular", "pd", "epd"])
 @pytest.mark.parametrize("second_model", ["regular", "pd", "epd"])
-def test_models_starting_concurrently_use_disjoint_ports(monkeypatch, first_model, second_model):
+def test_models_starting_concurrently_use_disjoint_ports(monkeypatch, first_model, second_model, shared):
     from slime.backends.sglang_utils import deployment, engine_group
     from slime.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig
 
@@ -449,6 +450,7 @@ def test_models_starting_concurrently_use_disjoint_ports(monkeypatch, first_mode
         "epd": [("encoder", 1), ("prefill", 1), ("decode", 2)],
     }
     config = SglangConfig(
+        share_model_gpus=shared,
         models=[
             ModelConfig(
                 name=name,
@@ -462,8 +464,10 @@ def test_models_starting_concurrently_use_disjoint_ports(monkeypatch, first_mode
         ]
     )
     engines = []
+    devices = []
 
     def create_engine(*args, **kwargs):
+        devices.append(kwargs["base_gpu_id"])
         engine = Mock()
         # Simulate slow initialization: ports are still free when the next
         # model is allocated. OS availability checks cannot prevent reuse.
@@ -503,6 +507,8 @@ def test_models_starting_concurrently_use_disjoint_ports(monkeypatch, first_mode
 
     assert list(servers) == ["actor", "ref"]
     assert len(engines) == 8
+    assert devices == (list(range(4)) * 2 if shared else list(range(8)))
+    assert config.total_num_gpus == (4 if shared else 8)
     assert len(init_handles) == 8 - (first_model == "epd") - (second_model == "epd")
     reserved = set()
     for engine in engines:

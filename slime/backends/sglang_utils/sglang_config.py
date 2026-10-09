@@ -139,6 +139,9 @@ class SglangConfig:
               - worker_type: regular
                 num_gpus: 4
 
+    ``share_model_gpus: true`` at the YAML root places each model from GPU
+    slot zero, sharing devices while retaining separate weights and routers.
+
     Each model gets its own router.  ``placeholder`` groups reserve GPU
     slots without creating engines.  ``overrides`` are ``ServerArgs``
     field names applied on top of the base ``--sglang-*`` CLI args.
@@ -153,6 +156,7 @@ class SglangConfig:
     """
 
     models: list[ModelConfig]
+    share_model_gpus: bool = False
 
     @staticmethod
     def from_yaml(path: str) -> "SglangConfig":
@@ -177,7 +181,7 @@ class SglangConfig:
                     update_weights=m.get("update_weights"),
                 )
             )
-        return SglangConfig(models=models)
+        return SglangConfig(models=models, share_model_gpus=data.get("share_model_gpus", False))
 
     @staticmethod
     def from_prefill_num_servers(args) -> "SglangConfig":
@@ -204,7 +208,8 @@ class SglangConfig:
 
     @property
     def total_num_gpus(self) -> int:
-        return sum(m.total_num_gpus for m in self.models)
+        counts = [m.total_num_gpus for m in self.models]
+        return max(counts, default=0) if self.share_model_gpus else sum(counts)
 
 
 def resolve_sglang_config(args) -> SglangConfig:

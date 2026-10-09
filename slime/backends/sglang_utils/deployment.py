@@ -97,6 +97,9 @@ def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
 
     for model_idx, model_config in enumerate(config.models):
         model_config.resolve(args)
+        if config.share_model_gpus:
+            # Share devices, not engine ranks, ports, or model weights.
+            placement.gpu_offset = 0
 
         router_ip, router_port = _start_router(
             args,
