@@ -299,14 +299,6 @@ class RolloutServer:
                     ]
                 )
 
-            reloads = [
-                engine.update_weights_from_disk.remote(model_path)
-                for model_path, engines in non_updatable_groups_engines
-                for engine in engines
-            ]
-            if reloads:
-                ray.get(reloads)
-
     def offload(self):
         """Release memory occupation across all groups (concurrent)."""
         handles = []
@@ -328,18 +320,7 @@ class RolloutServer:
             if not g.needs_offload:
                 continue
             handles.extend(g.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
-        result = ray.get(handles) if handles else []
-        if not self.update_weights:
-            # Resuming memory allocation does not supply trained weights. Frozen
-            # pools reload their own checkpoint instead of receiving actor weights.
-            reloads = [
-                engine.update_weights_from_disk.remote(g.model_path)
-                for g in self.server_groups if g.needs_offload
-                for engine in g.engines
-            ]
-            if reloads:
-                ray.get(reloads)
-        return result
+        return ray.get(handles) if handles else []
 
     def onload_kv(self):
         """Resume KV cache and CUDA graphs for offloaded groups."""
