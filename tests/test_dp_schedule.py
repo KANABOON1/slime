@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from slime.utils.dp_schedule import build_dp_schedule
+from slime.utils.dp_schedule import build_dp_schedule, pad_steps_for_dp_alignment
 
 
 NUM_GPUS = 0
@@ -324,3 +324,36 @@ def test_rejects_when_fewer_rollouts_than_gbs():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+@pytest.mark.unit
+def test_padding_aligns_steps_whose_samples_cannot_be_split():
+    """Three oversized samples cannot form two mbs per rank on dp=2 without zero-loss padding."""
+    data = {
+        "rollout_ids": [0, 0, 1, 2],  # rollout 0 compiled into two samples
+        "tokens": [[1] * 20, [2] * 20, [3] * 20, [4] * 20],
+        "loss_masks": [[1] * 5, [1] * 5, [1] * 5, [1] * 5],
+        "rewards": [1.0, 1.0, 0.0, 0.5],
+    }
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=10)
+    tp = make_tp(dp_size=2)
+    with pytest.raises(AssertionError):
+        build_dp_schedule(args, tp, [20, 20, 20], global_batch_size=2, rollout_indices=[0, 0, 1])
+
+    padded = pad_steps_for_dp_alignment(data, tp, global_batch_size=2)
+    # Step [0, 1] has 3 samples -> one copy of its first sample; rollout 2 alone cannot fill a step.
+    assert padded["rollout_ids"] == [0, 0, 1, 0]
+    assert padded["tokens"][3] == data["tokens"][0]
+    assert padded["loss_masks"] == [[1] * 5, [1] * 5, [1] * 5, [0] * 5]
+    assert padded["rewards"] == [1.0, 1.0, 0.0, 1.0]
+    lengths = [len(t) for t in padded["tokens"]]
+    partitions, mbi, nmb, _ = build_dp_schedule(
+        args, tp, lengths, global_batch_size=2, rollout_indices=padded["rollout_ids"]
+    )
+    assert_invariants(partitions, mbi, nmb, dp_size=2, expected_global_sample_indices=range(4), total_lengths=lengths)
+
+
+@pytest.mark.unit
+def test_padding_leaves_aligned_steps_unchanged():
+    data = {"rollout_ids": [0, 1, 2, 3], "tokens": [[1], [2], [3], [4]], "loss_masks": [[1], [1], [1], [1]]}
+    assert pad_steps_for_dp_alignment(data, make_tp(dp_size=2), global_batch_size=2) == data

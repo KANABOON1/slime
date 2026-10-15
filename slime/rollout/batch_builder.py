@@ -18,7 +18,7 @@ from slime.observability.rollout_data_utils import (
     validate_rollout_routed_experts_for_replay,
 )
 from slime.utils.data import get_source
-from slime.utils.dp_schedule import build_dp_schedule
+from slime.utils.dp_schedule import build_dp_schedule, pad_steps_for_dp_alignment
 from slime.utils.misc import Box, load_function
 from slime.utils.rollout_transport import DiskPayloadRef, RolloutGroupRef, TrainBatchRef, pack_rollout_payload
 from slime.utils.tensor_store import TensorRef
@@ -435,6 +435,8 @@ class BatchBuilder:
         global_batch_size`` regardless of how many training samples each
         rollout produced.
         """
+        if self.args.use_dynamic_batch_size:
+            data = pad_steps_for_dp_alignment(data, self.train_parallel_config, self.args.global_batch_size)
         dp_size = self.train_parallel_config["dp_size"]
         total_lengths = [len(t) for t in data["tokens"]]
         data["total_lengths"] = total_lengths

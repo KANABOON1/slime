@@ -79,6 +79,34 @@ def _pack_step_into_mbs(
     return [list(range(i, min(i + micro_batch_size, n))) for i in range(0, n, micro_batch_size)]
 
 
+def pad_steps_for_dp_alignment(data: dict, train_parallel_config: dict, global_batch_size: int) -> dict:
+    """Pad each step with zero-loss copies until its sample count meets the DP alignment.
+
+    One rollout may compile into several samples, so a step's sample count is arbitrary. When every
+    sample already fills a micro-batch on its own, dynamic splitting cannot create the micro-batches
+    that DP alignment still needs. Copies of a real sample with an all-zero loss mask fill those
+    slots; they keep that sample's rollout id, so they add no gradient, reward or rollout.
+    Trailing rollouts that do not fill a step are dropped, as :func:`build_dp_schedule` does.
+    """
+    order = list(dict.fromkeys(data["rollout_ids"]))
+    align = train_parallel_config["dp_size"] * (
+        train_parallel_config["microbatch_group_size_per_vp_stage"] if train_parallel_config["vpp_size"] > 1 else 1
+    )
+    selected: list[int] = []
+    padding: list[bool] = []
+    for start in range(0, len(order) - global_batch_size + 1, global_batch_size):
+        step = set(order[start : start + global_batch_size])
+        members = [i for i, rollout_id in enumerate(data["rollout_ids"]) if rollout_id in step]
+        count = (-len(members)) % align
+        selected.extend([*members, *[members[0]] * count])
+        padding.extend([False] * len(members) + [True] * count)
+    result = {key: [values[i] for i in selected] for key, values in data.items()}
+    result["loss_masks"] = [
+        [0] * len(mask) if is_padding else mask for mask, is_padding in zip(result["loss_masks"], padding, strict=True)
+    ]
+    return result
+
+
 def build_dp_schedule(
     args: Any,
     train_parallel_config: dict,
