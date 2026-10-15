@@ -2,10 +2,12 @@
 # and https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ppo_utils/experience_maker.py
 
 from argparse import Namespace
+from functools import partial
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 def get_pg_loss_type(args):
@@ -885,6 +887,31 @@ def chunked_gae(
     return advantages, returns
 
 
+def _scaled_log_probs_and_entropy_chunk(
+    logits: torch.Tensor,
+    tokens: torch.Tensor,
+    log_prob_keep_mask: torch.Tensor | None,
+    *,
+    tp_group,
+    with_entropy: bool,
+    with_entropy_grad: bool,
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    # Cast before temperature scaling so half-precision logits are scaled in fp32, as the
+    # top-k path does; for fp32 logits both steps leave the values unchanged.
+    logits = logits.float()
+    if temperature != 1.0:
+        logits = logits / temperature
+    return _calculate_log_probs_and_entropy_chunk(
+        logits,
+        tokens,
+        tp_group,
+        with_entropy=with_entropy,
+        with_entropy_grad=with_entropy_grad,
+        log_prob_keep_mask=log_prob_keep_mask,
+    )
+
+
 def calculate_log_probs_and_entropy(
     logits,
     tokens,
@@ -893,47 +920,39 @@ def calculate_log_probs_and_entropy(
     chunk_size: int = -1,
     log_prob_keep_mask=None,
     with_entropy_grad: bool = True,
+    temperature: float = 1.0,
 ):
+    """Per-token log-probs (and entropy) over the full vocabulary, in fp32 row chunks.
+
+    ``logits`` may be fp32 or the model's half-precision output. With gradients enabled, each
+    chunk is recomputed in backward instead of keeping its fp32 softmax alive, so fp32 workspace
+    stays O(chunk_size * V) in both passes rather than O(T * V).
+    """
     logits = logits.contiguous()
-    entropy = None
-    if logits.size(0) != 0:
-        if chunk_size > 0:
-            num_chunks = (logits.size(0) - 1) // chunk_size + 1
-            logits_chunks = logits.chunk(num_chunks, dim=0)
-            tokens_chunks = tokens.chunk(num_chunks, dim=0)
-            mask_chunks = (
-                log_prob_keep_mask.chunk(num_chunks, dim=0) if log_prob_keep_mask is not None else [None] * num_chunks
-            )
+    if logits.size(0) == 0:
+        return logits.new_zeros((0,)), logits.new_zeros((0,)) if with_entropy else None
 
-            log_probs = []
-            entropy_chunks = []
-            for tokens_chunk, logits_chunk, mask_chunk in zip(tokens_chunks, logits_chunks, mask_chunks, strict=True):
-                log_prob, entropy_chunk = _calculate_log_probs_and_entropy_chunk(
-                    logits_chunk,
-                    tokens_chunk,
-                    tp_group,
-                    with_entropy=with_entropy,
-                    with_entropy_grad=with_entropy_grad,
-                    log_prob_keep_mask=mask_chunk,
-                )
-                log_probs.append(log_prob)
-                if entropy_chunk is not None:
-                    entropy_chunks.append(entropy_chunk)
-            log_prob = torch.cat(log_probs, dim=0)
-            if entropy_chunks:
-                entropy = torch.cat(entropy_chunks, dim=0)
+    num_chunks = (logits.size(0) - 1) // chunk_size + 1 if chunk_size > 0 else 1
+    mask_chunks = (
+        log_prob_keep_mask.chunk(num_chunks, dim=0) if log_prob_keep_mask is not None else [None] * num_chunks
+    )
+    compute = partial(
+        _scaled_log_probs_and_entropy_chunk,
+        tp_group=tp_group,
+        with_entropy=with_entropy,
+        with_entropy_grad=with_entropy_grad,
+        temperature=temperature,
+    )
+    recompute = torch.is_grad_enabled() and logits.requires_grad
+    log_probs, entropy_chunks = [], []
+    for logits_chunk, tokens_chunk, mask_chunk in zip(
+        logits.chunk(num_chunks, dim=0), tokens.chunk(num_chunks, dim=0), mask_chunks, strict=True
+    ):
+        if recompute:
+            log_prob, entropy_chunk = checkpoint(compute, logits_chunk, tokens_chunk, mask_chunk, use_reentrant=False)
         else:
-            log_prob, entropy = _calculate_log_probs_and_entropy_chunk(
-                logits,
-                tokens,
-                tp_group,
-                with_entropy=with_entropy,
-                with_entropy_grad=with_entropy_grad,
-                log_prob_keep_mask=log_prob_keep_mask,
-            )
-    else:
-        log_prob = logits.new_zeros((0,))
-        if with_entropy:
-            entropy = logits.new_zeros((0,))
-
-    return log_prob, entropy
+            log_prob, entropy_chunk = compute(logits_chunk, tokens_chunk, mask_chunk)
+        log_probs.append(log_prob)
+        if entropy_chunk is not None:
+            entropy_chunks.append(entropy_chunk)
+    return torch.cat(log_probs, dim=0), torch.cat(entropy_chunks, dim=0) if entropy_chunks else None

@@ -119,7 +119,8 @@ def get_responses(
 
     Args:
         logits: Model outputs with shape `[1, T, V]` (policy) or `[1, T, 1]`
-            (value). Must be float32.
+            (value), in fp32 or the model's half precision; consumers cast
+            per chunk.
         args: Configuration containing `rollout_temperature` for optional scaling.
         unconcat_tokens: List of token tensors (prompt+response) per sample.
         total_lengths: Total sequence lengths (prompt+response) per sample.
@@ -131,7 +132,6 @@ def get_responses(
         `[R, V]` (policy) or `[R, 1]` (value) and `tokens_chunk` is shape `[R]`
         (1D int64), both aligned to response tokens for one sample.
     """
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
     assert logits.size(0) == 1, f"{logits.shape}"
     logits = logits.squeeze(0)
@@ -548,16 +548,11 @@ def get_log_probs_and_entropy(
     log-probabilities; entropy is always computed from the unmasked logits.
     """
     assert non_loss_data
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
     assert logits.size(0) == 1, f"{logits.shape}"
-    logits = logits.squeeze(0)
-
-    # Apply rollout temperature scaling to logits to match rollout-time log-probs.
-    rollout_temperature = getattr(args, "rollout_temperature", 1.0)
-    if rollout_temperature != 1.0:
-        logits = logits / rollout_temperature
-    logits = logits.contiguous()
+    # Half-precision logits stay in place; chunks are cast to fp32 and then scaled by the
+    # rollout temperature (to match rollout-time log-probs) inside the log-prob computation.
+    logits = logits.squeeze(0).contiguous()
     T = logits.size(0)
     device = logits.device
     tp_group = mpu.get_tensor_model_parallel_group()
@@ -592,6 +587,7 @@ def get_log_probs_and_entropy(
         with_entropy_grad=with_entropy_grad,
         chunk_size=chunk_size,
         log_prob_keep_mask=top_p_keep_mask,
+        temperature=getattr(args, "rollout_temperature", 1.0),
     )
     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
 
@@ -659,7 +655,7 @@ def get_values(
         apply_temperature=False,
     ):
         assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
-        value_list.append(logits_chunk.squeeze(-1))
+        value_list.append(logits_chunk.squeeze(-1).float())
 
     res = {
         "values": value_list,

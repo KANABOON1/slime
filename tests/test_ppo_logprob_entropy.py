@@ -418,3 +418,59 @@ def test_calculate_log_probs_and_entropy_matches_unfused_reference_vocab_paralle
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+@pytest.mark.parametrize("temperature", [1.0, 0.7])
+@pytest.mark.parametrize("with_entropy", [False, True])
+def test_half_precision_logits_match_upcast_fp32_reference(temperature: float, with_entropy: bool):
+    """bf16 logits are cast and scaled per chunk exactly as an fp32 copy of the whole tensor."""
+    torch.manual_seed(0)
+    half = (torch.randn(9, 11) * 3).to(torch.bfloat16).requires_grad_()
+    tokens = torch.randint(0, 11, (9,))
+    log_probs, entropy = calculate_log_probs_and_entropy(
+        half, tokens, tp_group=None, with_entropy=with_entropy, chunk_size=4, temperature=temperature
+    )
+    reference = half.detach().float().requires_grad_()
+    expected_log_probs, expected_entropy = calculate_log_probs_and_entropy(
+        reference / temperature, tokens, tp_group=None, with_entropy=with_entropy, chunk_size=-1
+    )
+    torch.testing.assert_close(log_probs, expected_log_probs, rtol=STRICT_RTOL, atol=STRICT_ATOL)
+    if with_entropy:
+        torch.testing.assert_close(entropy, expected_entropy, rtol=STRICT_RTOL, atol=STRICT_ATOL)
+
+    weights = torch.linspace(-1.0, 1.0, 9)
+    (log_probs.squeeze(-1) * weights).sum().backward()
+    (expected_log_probs.squeeze(-1) * weights).sum().backward()
+    assert half.grad.dtype == torch.bfloat16
+    # The gradient is accumulated in fp32 per chunk and stored once in the input precision.
+    torch.testing.assert_close(half.grad, reference.grad.to(torch.bfloat16), rtol=0.0, atol=0.0)
+
+
+def test_backward_never_keeps_a_full_fp32_softmax():
+    rows, vocab, chunk = 64, 50, 8
+    logits = torch.randn(rows, vocab).to(torch.bfloat16).requires_grad_()
+    tokens = torch.randint(0, vocab, (rows,))
+    saved = []
+
+    def pack(tensor):
+        saved.append(tensor)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        log_probs, _ = calculate_log_probs_and_entropy(logits, tokens, tp_group=None, chunk_size=chunk)
+    # Only the half-precision input chunks (and small per-row tensors) stay alive until backward.
+    assert all(t.dtype != torch.float32 or t.numel() <= chunk * vocab for t in saved)
+    assert sum(t.numel() for t in saved if t.dtype == torch.float32) < rows * vocab
+    log_probs.sum().backward()
+    assert logits.grad.shape == logits.shape
+
+
+def test_forward_only_does_not_recompute(monkeypatch):
+    import slime.utils.ppo_utils as ppo_utils
+
+    monkeypatch.setattr(ppo_utils, "checkpoint", lambda *args, **kwargs: pytest.fail("no recompute without grad"))
+    with torch.no_grad():
+        log_probs, _ = calculate_log_probs_and_entropy(
+            torch.randn(5, 7).to(torch.bfloat16), torch.randint(0, 7, (5,)), tp_group=None, chunk_size=2
+        )
+    assert log_probs.dtype == torch.float32

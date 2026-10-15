@@ -40,6 +40,16 @@ from .stateless_adam import StatelessAdam
 logger = logging.getLogger(__name__)
 
 
+def _half_precision_output(args: Namespace) -> dict:
+    """Keep bf16/fp16 logits instead of Megatron's whole-sequence fp32 copy.
+
+    The logits come from a half-precision matmul, so the upcast adds no precision; the log-prob
+    and entropy code casts row chunks to fp32. For long sequences the [T, V] fp32 copy (and its
+    gradient) is what exhausts a single GPU.
+    """
+    return {"fp32_output": False} if args.bf16 or args.fp16 else {}
+
+
 def _disable_tqdm_for_non_main_rank() -> bool:
     return not (
         mpu.get_data_parallel_rank(with_context_parallel=True) == 0
@@ -430,6 +440,7 @@ def forward_only(
             "labels": None,
             "packed_seq_params": packed_seq_params,
             "loss_mask": batch["full_loss_masks"],
+            **_half_precision_output(args),
         }
         if batch["multimodal_train_inputs"] is not None:
             forward_kwargs.update(batch["multimodal_train_inputs"])
@@ -631,6 +642,7 @@ def train_one_step(
                 "labels": None,
                 "packed_seq_params": batch["packed_seq_params"],
                 "loss_mask": batch["full_loss_masks"],
+                **_half_precision_output(args),
             }
 
             if batch["multimodal_train_inputs"] is not None:
