@@ -126,8 +126,9 @@ class ServerGroup:
                 for key, default_val in {
                     "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
                     "SGLANG_JIT_DEEPGEMM_FAST_WARMUP": "true",
-                    "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
-                    "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+                    # Current SGLang reads only this name. Its alias shim copies the legacy
+                    # SGL_DISABLE_... value into this inverted variable, so no legacy name is set.
+                    "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "false",
                     "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
                     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
                     "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
